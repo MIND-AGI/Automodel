@@ -562,7 +562,11 @@ def build_dataloader(
                     logging.info(f"Shuffling IterableDataset with buffer_size={shuffle_buffer_size}, seed={seed}")
                 except Exception as e:
                     logging.warning(f"IterableDataset shuffle skipped due to error: {e}")
-            dl_kwargs = {}
+            
+            iterable_batch_size = cfg_dl.get("batch_size", local_batch_size)
+            if "batch_size" in cfg_dl:
+                del cfg_dl.batch_size
+            dl_kwargs = {"batch_size": iterable_batch_size}
 
         # Handle collate_fn with optional mask precomputation for pipeline parallelism
         dl_kwargs = dl_kwargs | {"dataset": ds}
@@ -663,15 +667,24 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if cfg is None:
         return None
 
-    # Calculate total steps for the training run
-    total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
     if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
+        total_steps = step_scheduler.max_steps
+    else: 
+        # Calculate total steps for the training run
+        total_epochs = step_scheduler.num_epochs
+        grad_acc_steps = step_scheduler.grad_acc_steps
+        try:
+            epoch_len = len(step_scheduler.dataloader)
+        except TypeError:
+            # If dataloader length is not defined (e.g., IterableDataset), fallback to an estimate or require max_steps
+            logger.warning(
+                "Dataloader length is not defined; total steps cannot be calculated. "
+                "Please provide max_steps in the step scheduler config."
+            )
+            total_steps = None
+
+        # Total optimizer steps (accounting for gradient accumulation)
+        total_steps = (total_epochs * epoch_len) // grad_acc_steps
 
     # Set defaults for scheduler parameters
     optimizer_param_schedulers = []
