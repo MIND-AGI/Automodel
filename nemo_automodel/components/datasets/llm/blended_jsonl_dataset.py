@@ -123,7 +123,7 @@ class BlendedJSONLDataset(IterableDataset):
         self.seq_len = int(seq_len)
         self.tokenizer = tokenizer
         self.tokenizer_config = tokenizer_config
-        self.dataset_type = "bufshuf_sjsonl"
+        self.dataset_type = dataset_type
         self.shuffle_files = shuffle_files
         self.text_key = text_key
         self.sample_buffer_size = int(sample_buffer_size)

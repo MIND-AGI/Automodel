@@ -155,6 +155,12 @@ class BufShufSJSONLDataset(IterableDataset):
         # Internal state tracking
         self._current_state: Optional[BufShufSJSONLDatasetState] = None
 
+    def _normalize_token_buffer_state(self, token_buffer: List[int], token_buffer_offset: int) -> tuple[List[int], int]:
+        """Store a compact token buffer so checkpointed state is resume-safe."""
+        if token_buffer_offset > len(token_buffer) // 2 and token_buffer_offset > 0:
+            return token_buffer[token_buffer_offset:].copy(), 0
+        return token_buffer.copy(), token_buffer_offset
+
     def state_dict(self) -> BufShufSJSONLDatasetState:
         """Returns current state for checkpointing."""
         if self._current_state is None:
@@ -274,6 +280,17 @@ class BufShufSJSONLDataset(IterableDataset):
             current_file_idx = resume_state["current_file_idx"]
             file_state = resume_state["file_state"].copy()
             buffer_state = resume_state["buffer_state"].copy()
+            normalized_token_buffer, normalized_token_buffer_offset = self._normalize_token_buffer_state(
+                buffer_state["token_buffer"],
+                buffer_state["token_buffer_offset"],
+            )
+            buffer_state = BufShufBufferState(
+                token_buffer=normalized_token_buffer,
+                token_buffer_offset=normalized_token_buffer_offset,
+                sample_buffer=buffer_state["sample_buffer"].copy(),
+                sample_buffer_idx=buffer_state["sample_buffer_idx"],
+                documents_processed=buffer_state["documents_processed"],
+            )
             epoch = resume_state["epoch"]
         else:
             if worker is not None:
@@ -459,10 +476,14 @@ class BufShufSJSONLDataset(IterableDataset):
                 
                 # Yield all shuffled samples
                 for i in range(len(sample_buffer)):
+                    normalized_token_buffer, normalized_token_buffer_offset = self._normalize_token_buffer_state(
+                        token_buffer,
+                        token_buffer_offset,
+                    )
                     # Update state before yielding
                     new_buffer_state = BufShufBufferState(
-                        token_buffer=token_buffer.copy(),
-                        token_buffer_offset=token_buffer_offset,
+                        token_buffer=normalized_token_buffer,
+                        token_buffer_offset=normalized_token_buffer_offset,
                         sample_buffer=sample_buffer[i + 1 :].copy(),
                         sample_buffer_idx=0,
                         documents_processed=documents_processed,
@@ -492,10 +513,14 @@ class BufShufSJSONLDataset(IterableDataset):
         if sample_buffer:
             rng.shuffle(sample_buffer)
             for i, sample in enumerate(sample_buffer):
+                normalized_token_buffer, normalized_token_buffer_offset = self._normalize_token_buffer_state(
+                    token_buffer,
+                    token_buffer_offset,
+                )
                 # Update state
                 new_buffer_state = BufShufBufferState(
-                    token_buffer=token_buffer.copy(),
-                    token_buffer_offset=token_buffer_offset,
+                    token_buffer=normalized_token_buffer,
+                    token_buffer_offset=normalized_token_buffer_offset,
                     sample_buffer=sample_buffer[i + 1 :].copy(),
                     sample_buffer_idx=0,
                     documents_processed=documents_processed,
@@ -515,9 +540,13 @@ class BufShufSJSONLDataset(IterableDataset):
                 yield sample
         
         # Update final state
+        normalized_token_buffer, normalized_token_buffer_offset = self._normalize_token_buffer_state(
+            token_buffer,
+            token_buffer_offset,
+        )
         final_buffer_state = BufShufBufferState(
-            token_buffer=token_buffer.copy(),
-            token_buffer_offset=token_buffer_offset,
+            token_buffer=normalized_token_buffer,
+            token_buffer_offset=normalized_token_buffer_offset,
             sample_buffer=[],
             sample_buffer_idx=0,
             documents_processed=documents_processed,
