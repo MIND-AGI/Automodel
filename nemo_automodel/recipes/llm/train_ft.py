@@ -322,6 +322,15 @@ def build_model_and_optimizer(
         # ensure the model is on device
         model = model.to(device)
 
+        # For meta-init flows (e.g., custom model + FSDP2), log stats again after
+        # parameters are materialized so Param L2 norm is meaningful.
+        if is_meta_device and load_weights:
+            trainable_params, total_params = print_trainable_parameters(model)
+            param_info = {
+                "trainable_params": trainable_params,
+                "total_params": total_params,
+            }
+
         # Apply torch.compile if configured
         if cfg_compile is not None:
             compile_config = build_compile_config(cfg_compile)

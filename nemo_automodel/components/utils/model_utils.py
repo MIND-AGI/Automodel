@@ -53,7 +53,7 @@ def _supports_seq_lens(model: nn.Module) -> bool:
         return False
 
 
-def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
+def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float, int]:
     """
     Get the number of trainable parameters and the L2 norm of the model.
 
@@ -64,21 +64,26 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         total_params: int
         trainable_params: int
         local_sq_norm: float
+        materialized_params: int
     """
     total_params = 0
     trainable_params = 0
     local_sq_norm = 0.0
+    materialized_params = 0
 
     for p in model.parameters():
         n = p.numel()
         total_params += n
         if p.requires_grad:
             trainable_params += n
+        if getattr(p, "is_meta", False):
+            continue
+        materialized_params += 1
         try:
             local_sq_norm += float(p.detach().float().norm(2).item() ** 2)
         except Exception:
             pass
-    return total_params, trainable_params, local_sq_norm
+    return total_params, trainable_params, local_sq_norm, materialized_params
 
 
 def resolve_trust_remote_code(pretrained_model_name_or_path):
@@ -107,7 +112,7 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
         trainable_params: int
         total_params: int
     """
-    total_params, trainable_params, local_sq_norm = _get_model_param_stats(model)
+    total_params, trainable_params, local_sq_norm, materialized_params = _get_model_param_stats(model)
 
     try:
         # TODO(@akoumparouli): make this sharding aware.
@@ -119,7 +124,10 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
         logging.info(f"Trainable parameters: {trainable_params:,}")
         logging.info(f"Total parameters: {total_params:,}")
         logging.info(f"Trainable parameters percentage: {trainable_pct:.2f}%")
-        logging.info(f"Param L2 norm: {local_sq_norm:.4f}")
+        if materialized_params == 0:
+            logging.info("Param L2 norm: <unavailable before parameter materialization>")
+        else:
+            logging.info(f"Param L2 norm: {local_sq_norm:.4f}")
         logging.info("--------------------------------")
     except Exception:
         logging.info("Model summary: <unavailable>")
