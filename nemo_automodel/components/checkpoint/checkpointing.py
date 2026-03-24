@@ -564,7 +564,10 @@ class Checkpointer:
             # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
             # however, HF initializes buffers with persistent=False, so we need to make sure these
             # buffer keys are not saved during checkpointing
-            keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+            # `model_state_dict_keys` can be empty/None for certain distributed save paths.
+            # Fall back to the current state_dict keys to avoid dropping every key.
+            valid_model_keys = set(self.config.model_state_dict_keys or state_dict.keys())
+            keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - valid_model_keys)
             if model_state.is_tied_lm_head:
                 keys_to_remove.append(model_state.lm_head_param_name)
             for key in keys_to_remove:
@@ -574,7 +577,7 @@ class Checkpointer:
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
-        default_index = max(fqn_to_file_index_mapping.values())
+        default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
         for fqn in list(state_dict.keys()):
