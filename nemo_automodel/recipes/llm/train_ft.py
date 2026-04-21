@@ -345,10 +345,18 @@ def build_model_and_optimizer(
         for part in model.parts:
             trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            # Log dtypes of trainable parameters for safe precision training
+            for p in trainable_params:
+                logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
+
             optimizer.append(cfg_opt.instantiate(params=trainable_params))
     else:
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        # Log dtypes of trainable parameters for safe precision training
+        for p in trainable_params:
+            logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
+
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
     return model, state_dict_keys, optimizer, loss_fn, param_info
