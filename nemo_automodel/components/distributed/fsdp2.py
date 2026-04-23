@@ -107,7 +107,7 @@ class FSDP2Manager:
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default=MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         ),

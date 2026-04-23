@@ -187,6 +187,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             )
+        
+        # Log the mixed precision policy being used
+        logger.info(f"Using mixed precision policy: {mp_policy}")
 
         # Find transformer layers and apply parallelisms
         apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)

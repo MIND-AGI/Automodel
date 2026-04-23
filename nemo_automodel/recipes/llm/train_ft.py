@@ -322,6 +322,15 @@ def build_model_and_optimizer(
         # ensure the model is on device
         model = model.to(device)
 
+        # For meta-init flows (e.g., custom model + FSDP2), log stats again after
+        # parameters are materialized so Param L2 norm is meaningful.
+        if is_meta_device and load_weights:
+            trainable_params, total_params = print_trainable_parameters(model)
+            param_info = {
+                "trainable_params": trainable_params,
+                "total_params": total_params,
+            }
+
         # Apply torch.compile if configured
         if cfg_compile is not None:
             compile_config = build_compile_config(cfg_compile)
@@ -336,10 +345,18 @@ def build_model_and_optimizer(
         for part in model.parts:
             trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            # Log dtypes of trainable parameters for safe precision training
+            for p in trainable_params:
+                logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
+
             optimizer.append(cfg_opt.instantiate(params=trainable_params))
     else:
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        # Log dtypes of trainable parameters for safe precision training
+        for p in trainable_params:
+            logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
+
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
     return model, state_dict_keys, optimizer, loss_fn, param_info
@@ -1074,6 +1091,41 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+    def _resolve_train_dataset(self):
+        if self.dataloader is None:
+            return None
+        ds = getattr(self.dataloader, "dataset", None)
+        return ds
+
+    def _set_dataset_scheduler_step(self, step: int) -> None:
+        ds = self._resolve_train_dataset()
+        if ds is None or not hasattr(ds, "set_scheduler_step"):
+            return
+        try:
+            ds.set_scheduler_step(int(step))
+        except Exception as e:
+            logger.warning(f"Failed to set data scheduler step {step}: {e}")
+
+    def _sanitize_metric_key(self, key: str) -> str:
+        return str(key).replace("/", "_").replace(" ", "_").replace(":", "_")
+
+    def _get_data_scheduler_metrics(self, step: int) -> Dict[str, float]:
+        ds = self._resolve_train_dataset()
+        if ds is None or not hasattr(ds, "get_current_weights"):
+            return {}
+
+        try:
+            current_weights = ds.get_current_weights(step=step)
+        except Exception as e:
+            logger.warning(f"Failed to read data scheduler weights at step {step}: {e}")
+            return {}
+
+        metrics = {}
+        for source_name, weight in current_weights.items():
+            safe_name = self._sanitize_metric_key(source_name)
+            metrics[f"data_scheduler/weight/{safe_name}"] = float(weight)
+        return metrics
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1131,6 +1183,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
+            # Prime dataset scheduler step before the iterator fetches the next batch group.
+            self._set_dataset_scheduler_step(self.step_scheduler.step)
             # The step scheduler yields a list of batches with the following properties:
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
@@ -1163,6 +1217,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         val_losses,
                         best_metric_key=self.best_metric_key,
                     )
+
+                # Prepare scheduler step for the next batch fetch. StepScheduler increments
+                # its internal counter after each yield returns control to it.
+                self._set_dataset_scheduler_step(self.step_scheduler.step + 1)
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
@@ -1347,6 +1405,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
 
+        scheduler_metrics = self._get_data_scheduler_metrics(self.step_scheduler.step)
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
@@ -1359,7 +1419,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
-            },
+            }
+            | scheduler_metrics,
         )
 
     @torch.no_grad()
