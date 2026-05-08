@@ -161,6 +161,7 @@ class BlendedJSONLDataset(IterableDataset):
         self._warned_internal_step_fallback = False
 
         self._current_state: Optional[BlendedJSONLDatasetState] = None
+        self._source_datasets: Optional[Dict[str, IterableDataset]] = None
 
     def set_scheduler_step(self, step: int) -> None:
         """Set global train step used by data scheduler."""
@@ -217,7 +218,13 @@ class BlendedJSONLDataset(IterableDataset):
                 tokenizer_config=self.tokenizer_config,
                 data_scheduler_state=self.data_scheduler.state_dict(),
             )
-        return copy.deepcopy(self._current_state)
+        # Get latest source states only when checkpointing
+        state = copy.deepcopy(self._current_state)
+        if self._source_datasets:
+            for source_name, ds in self._source_datasets.items():
+                if hasattr(ds, "state_dict"):
+                    state["source_states"][source_name] = ds.state_dict()
+        return state
 
     def load_state_dict(self, state: BlendedJSONLDatasetState) -> None:
         self.resume_state = state
@@ -301,6 +308,9 @@ class BlendedJSONLDataset(IterableDataset):
             if source_name not in source_states and hasattr(ds, "state_dict"):
                 source_states[source_name] = ds.state_dict()
 
+        # Store reference to source_datasets for deferred state_dict() calls
+        self._source_datasets = source_datasets
+
         self._set_current_state(
             source_items=source_items,
             source_states=source_states,
@@ -339,9 +349,6 @@ class BlendedJSONLDataset(IterableDataset):
             samples_emitted += 1
             if self._scheduler_step is None:
                 self.data_scheduler.step(1)
-
-            selected_ds = source_datasets[selected_source]
-            source_states[selected_source] = selected_ds.state_dict()
 
             self._set_current_state(
                 source_items=source_items,

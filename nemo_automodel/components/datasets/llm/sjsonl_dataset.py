@@ -16,6 +16,7 @@ import json
 import os
 import random
 from pathlib import Path
+from copy import deepcopy
 from typing import Iterator, List, Sequence, Optional, TypedDict, Dict, Any
 
 import torch
@@ -153,6 +154,13 @@ class SJSONLDataset(IterableDataset):
         # Internal state tracking
         self._current_state: Optional[JSONLDatasetState] = None
 
+    def _normalize_token_buffer(self, token_buffer: List[int], token_buffer_offset: int) -> tuple[List[int], int]:
+        """Compact the token buffer in place only when the skipped prefix is large."""
+        if token_buffer_offset > len(token_buffer) // 2 and token_buffer_offset > 0:
+            del token_buffer[:token_buffer_offset]
+            return token_buffer, 0
+        return token_buffer, token_buffer_offset
+
     def state_dict(self) -> JSONLDatasetState:
         """
         Returns current state for checkpointing.
@@ -161,15 +169,15 @@ class SJSONLDataset(IterableDataset):
         Returns minimal valid state if iteration hasn't started yet.
         """
         if self._current_state is None:
-            # Return minimal valid state for uninitialized workers
             worker = get_worker_info()
             global_worker_id, total_workers = _get_worker_id_and_total_workers(worker)
             if len(self.files) >= total_workers:
                 block_size, offset = 1, 0
             else:
                 block_size, offset = total_workers, global_worker_id % total_workers
-            
-            return JSONLDatasetState(
+
+            # Initialize _current_state for uninitialized workers
+            self._current_state = JSONLDatasetState(
                 current_file_idx=0,
                 files_order=self.files.copy(),
                 file_state=JSONLFileState(
@@ -190,8 +198,8 @@ class SJSONLDataset(IterableDataset):
                 total_workers=total_workers,
                 tokenizer_config=self.tokenizer_config,
             )
-        
-        return self._current_state.copy()
+
+        return deepcopy(self._current_state)
 
     def load_state_dict(self, state: JSONLDatasetState) -> None:
         """
@@ -200,7 +208,9 @@ class SJSONLDataset(IterableDataset):
         Args:
             state: JSONLDatasetState from a previous checkpoint.
         """
-        self.resume_state = state
+        # Snapshot the provided state as the authoritative current runtime state
+        self._current_state = deepcopy(state)
+        self.resume_state = None
 
     def _read_jsonl_lines(
         self,
@@ -296,48 +306,43 @@ class SJSONLDataset(IterableDataset):
         files: List[str],
         shuffle: bool,
         resume_state: Optional[JSONLDatasetState],
-    ) -> tuple[List[str], random.Random, int, JSONLFileState, BufferState, int, int, int]:
-        """
-        Set up worker-specific context.
-        
-        Returns:
-            Tuple of (worker_files, rng, current_file_idx, file_state, 
-                     buffer_state, epoch, global_worker_id, total_workers)
-        """
+    ) -> None:
+        """Set up worker-specific context and initialize `_current_state`."""
         worker = get_worker_info()
         global_worker_id, total_workers = _get_worker_id_and_total_workers(worker)
-        
+
         rng = random.Random()
-        
+
         if resume_state is not None:
-            # Validate worker consistency
-            if resume_state["global_worker_id"] != global_worker_id:
+            # Restore authoritative runtime state
+            self._current_state = deepcopy(resume_state)
+            state = self._current_state
+            if state["global_worker_id"] != global_worker_id:
                 raise ValueError(
                     f"Resume state worker ID mismatch: expected {global_worker_id}, "
-                    f"got {resume_state['global_worker_id']}"
+                    f"got {state['global_worker_id']}"
                 )
-            if resume_state["total_workers"] != total_workers:
+            if state["total_workers"] != total_workers:
                 raise ValueError(
                     f"Resume state total workers mismatch: expected {total_workers}, "
-                    f"got {resume_state['total_workers']}"
+                    f"got {state['total_workers']}"
                 )
-            
-            # Restore state
-            rng.setstate(resume_state["rng_state"])
-            worker_files = resume_state["files_order"].copy()
-            current_file_idx = resume_state["current_file_idx"]
-            file_state = resume_state["file_state"].copy()
-            buffer_state = resume_state["buffer_state"].copy()
-            epoch = resume_state["epoch"]
+
+            rng.setstate(state["rng_state"])
+            # Normalize token buffer on resume
+            buffer_state = state["buffer_state"]
+            normalized_buffer, normalized_offset = self._normalize_token_buffer(
+                buffer_state["buffer"], buffer_state["buffer_token_offset"]
+            )
+            buffer_state["buffer"] = normalized_buffer
+            buffer_state["buffer_token_offset"] = normalized_offset
+            state["buffer_state"] = buffer_state
         else:
-            # Fresh start - deterministic seeding
             if worker is not None:
                 rng.seed(worker.id + 12345)
             else:
                 rng.seed(os.getpid())
-            
-            # Prefer file-level sharding. Only use line-level sharding when
-            # there are fewer files than workers.
+
             if len(files) >= total_workers:
                 worker_files = files[global_worker_id::total_workers].copy()
                 block_size = 1
@@ -346,13 +351,12 @@ class SJSONLDataset(IterableDataset):
                 worker_files = files.copy()
                 block_size = total_workers
                 offset = global_worker_id % total_workers
-            
+
             if shuffle:
                 rng.shuffle(worker_files)
-            
+
             current_file_idx = 0
-            
-            # Initialize file state for first file
+
             file_state = JSONLFileState(
                 file_path=worker_files[0] if worker_files else "",
                 position=0,
@@ -361,25 +365,30 @@ class SJSONLDataset(IterableDataset):
                 offset=offset,
                 current_iter=0,
             )
-            
-            # Initialize empty buffer
+
             buffer_state = BufferState(
                 buffer=[],
                 buffer_token_offset=0,
             )
-            
+
             epoch = 0
-        
-        return (
-            worker_files,
-            rng,
-            current_file_idx,
-            file_state,
-            buffer_state,
-            epoch,
-            global_worker_id,
-            total_workers,
-        )
+            self._current_state = JSONLDatasetState(
+                current_file_idx=current_file_idx,
+                files_order=worker_files,
+                file_state=file_state,
+                buffer_state=buffer_state,
+                rng_state=rng.getstate(),
+                epoch=epoch,
+                global_worker_id=global_worker_id,
+                total_workers=total_workers,
+                tokenizer_config=self.tokenizer_config,
+            )
+
+        # Ensure top-level fields reflect current worker context
+        state = self._current_state
+        state["global_worker_id"] = global_worker_id
+        state["total_workers"] = total_workers
+        state["rng_state"] = rng.getstate()
 
     def _update_state(
         self,
@@ -393,11 +402,12 @@ class SJSONLDataset(IterableDataset):
         total_workers: int,
     ) -> None:
         """Update internal state for checkpointing."""
+        # Keep this helper for external explicit snapshots, but avoid hot-path copies.
         self._current_state = JSONLDatasetState(
             current_file_idx=current_file_idx,
             files_order=files_order.copy(),
-            file_state=file_state.copy(),
-            buffer_state=buffer_state.copy(),
+            file_state=deepcopy(file_state),
+            buffer_state=deepcopy(buffer_state),
             rng_state=rng.getstate(),
             epoch=epoch,
             global_worker_id=global_worker_id,
@@ -405,17 +415,8 @@ class SJSONLDataset(IterableDataset):
             tokenizer_config=self.tokenizer_config,
         )
 
-    def _process_file_with_buffer(
+    def _process_file(
         self,
-        file_path: str,
-        file_state: JSONLFileState,
-        buffer_state: BufferState,
-        worker_files: List[str],
-        current_file_idx: int,
-        rng: random.Random,
-        epoch: int,
-        global_worker_id: int,
-        total_workers: int,
     ) -> Iterator[dict]:
         """
         Process a single file, managing buffer and yielding samples.
@@ -432,8 +433,18 @@ class SJSONLDataset(IterableDataset):
         Yields:
             Training samples (dicts with 'input_ids' and 'labels')
         """
-        # Extract buffer state
-        buffer = buffer_state["buffer"].copy()
+        state = self._current_state
+        file_state = state["file_state"]
+        buffer_state = state["buffer_state"]
+        rng = random.Random()
+        rng.setstate(state["rng_state"])
+        current_file_idx = state["current_file_idx"]
+        worker_files = state["files_order"]
+        epoch = state["epoch"]
+        global_worker_id = state["global_worker_id"]
+        total_workers = state["total_workers"]
+
+        token_buffer = buffer_state["buffer"]
         buffer_offset = buffer_state["buffer_token_offset"]
         
         # Read lines from file
@@ -453,7 +464,7 @@ class SJSONLDataset(IterableDataset):
             tokens = self._tokenize_text(text)
             
             # Add tokens to buffer
-            buffer.extend(tokens)
+            token_buffer.extend(tokens)
             
             # Update file state for next iteration
             file_state = JSONLFileState(
@@ -464,75 +475,52 @@ class SJSONLDataset(IterableDataset):
                 offset=file_state["offset"],
                 current_iter=file_state["current_iter"],
             )
+            state["file_state"] = file_state
             
             # Yield samples from buffer while we have enough tokens
-            while len(buffer) - buffer_offset >= self.seq_len + 1:
+            while len(token_buffer) - buffer_offset >= self.seq_len + 1:
                 # Extract sequence
                 start_idx = buffer_offset
                 end_idx = start_idx + self.seq_len + 1
-                
-                sequence = buffer[start_idx:end_idx]
+
+                sequence = token_buffer[start_idx:end_idx]
                 inputs = sequence[:-1]
                 labels = sequence[1:]
                 
-                # Megatron-compatible 1-token overlap: stride by seq_len,
-                # while each sample still uses seq_len + 1 tokens.
+                # 1-token overlap: stride by seq_len
                 buffer_offset += self.seq_len
-                
-                
-                # Update state before yielding
-                new_buffer_state = BufferState(
-                    buffer=buffer.copy(),
-                    buffer_token_offset=buffer_offset,
-                )
-                
-                self._update_state(
-                    current_file_idx=current_file_idx,
-                    files_order=worker_files,
-                    file_state=file_state,
-                    buffer_state=new_buffer_state,
-                    rng=rng,
-                    epoch=epoch,
-                    global_worker_id=global_worker_id,
-                    total_workers=total_workers,
-                )
-                
+                # Update runtime buffer offsets in-place (avoid copies)
+                buffer_state["buffer"] = token_buffer
+                buffer_state["buffer_token_offset"] = buffer_offset
+                state["buffer_state"] = buffer_state
+                state["file_state"] = file_state
                 yield dict(input_ids=inputs, labels=labels)
             
-            # Compact buffer if offset is large (keep only remaining tokens)
-            if buffer_offset > len(buffer) // 2 and buffer_offset > 0:
-                buffer = buffer[buffer_offset:]
+            # Compact buffer in-place if offset is large (keep only remaining tokens)
+            if buffer_offset > len(token_buffer) // 2 and buffer_offset > 0:
+                del token_buffer[:buffer_offset]
                 buffer_offset = 0
+                buffer_state["buffer"] = token_buffer
+                buffer_state["buffer_token_offset"] = buffer_offset
+                state["buffer_state"] = buffer_state
         
         # File exhausted - update buffer state for next file
         # Keep remaining tokens in buffer for next file
-        final_buffer_state = BufferState(
-            buffer=buffer.copy(),
-            buffer_token_offset=buffer_offset,
-        )
-        
-        # Update state with exhausted file (position at end, ready for next file)
-        self._update_state(
-            current_file_idx=current_file_idx,
-            files_order=worker_files,
-            file_state=file_state,
-            buffer_state=final_buffer_state,
-            rng=rng,
-            epoch=epoch,
-            global_worker_id=global_worker_id,
-            total_workers=total_workers,
-        )
+        # Update final state with normalized buffer
+        normalized_buffer, normalized_offset = self._normalize_token_buffer(token_buffer, buffer_offset)
+        buffer_state["buffer"] = normalized_buffer
+        buffer_state["buffer_token_offset"] = normalized_offset
+        state["current_file_idx"] = current_file_idx
+        state["files_order"] = worker_files
+        state["file_state"] = file_state
+        state["buffer_state"] = buffer_state
+        state["rng_state"] = rng.getstate()
+        state["epoch"] = epoch
+        state["global_worker_id"] = global_worker_id
+        state["total_workers"] = total_workers
 
     def _iterate_files(
         self,
-        worker_files: List[str],
-        rng: random.Random,
-        current_file_idx: int,
-        file_state: JSONLFileState,
-        buffer_state: BufferState,
-        epoch: int,
-        global_worker_id: int,
-        total_workers: int,
     ) -> Iterator[dict]:
         """
         Iterate through all files, handling epoch boundaries and shuffling.
@@ -542,9 +530,13 @@ class SJSONLDataset(IterableDataset):
         """
         while True:
             # Process files starting from current_file_idx
+            state = self._current_state
+            worker_files = state["files_order"]
+            current_file_idx = state["current_file_idx"]
+            file_state = state["file_state"]
             for file_idx in range(current_file_idx, len(worker_files)):
                 file_path = worker_files[file_idx]
-                
+
                 # Update file state if moving to new file
                 if file_idx != current_file_idx or file_state["file_path"] != file_path:
                     file_state = JSONLFileState(
@@ -555,49 +547,43 @@ class SJSONLDataset(IterableDataset):
                         offset=file_state["offset"],
                         current_iter=0,
                     )
-                
+                    state["file_state"] = file_state
+                    state["current_file_idx"] = file_idx
+
                 # Process this file
-                yield from self._process_file_with_buffer(
-                    file_path=file_path,
-                    file_state=file_state,
-                    buffer_state=buffer_state,
-                    worker_files=worker_files,
-                    current_file_idx=file_idx,
-                    rng=rng,
-                    epoch=epoch,
-                    global_worker_id=global_worker_id,
-                    total_workers=total_workers,
-                )
-                
-                # After processing file, reset file state for next file
-                # Buffer state is preserved from _process_file_with_buffer
-                buffer_state = self._current_state["buffer_state"].copy()
+                yield from self._process_file()
+                state = self._current_state
             
             # Epoch complete - reset for next epoch
-            epoch += 1
-            current_file_idx = 0
-            
-            # Reset file state for first file of new epoch
+            state = self._current_state
+            state["epoch"] = state.get("epoch", 0) + 1
+            state["current_file_idx"] = 0
+
             file_state = JSONLFileState(
-                file_path=worker_files[0],
+                file_path=state["files_order"][0],
                 position=0,
                 line_number=0,
-                block_size=file_state["block_size"],
-                offset=file_state["offset"],
-                current_iter=file_state["current_iter"] + 1,
+                block_size=state["file_state"]["block_size"],
+                offset=state["file_state"]["offset"],
+                current_iter=state["file_state"]["current_iter"] + 1,
             )
-            
+            state["file_state"] = file_state
+
             # Optionally reshuffle files
             if self.shuffle_files:
-                rng.shuffle(worker_files)
+                rng = random.Random()
+                rng.setstate(state["rng_state"])
+                rng.shuffle(state["files_order"])
+                state["rng_state"] = rng.getstate()
                 file_state = JSONLFileState(
-                    file_path=worker_files[0],
+                    file_path=state["files_order"][0],
                     position=0,
                     line_number=0,
-                    block_size=file_state["block_size"],
-                    offset=file_state["offset"],
-                    current_iter=file_state["current_iter"],
+                    block_size=state["file_state"]["block_size"],
+                    offset=state["file_state"]["offset"],
+                    current_iter=state["file_state"]["current_iter"],
                 )
+                state["file_state"] = file_state
 
     def __iter__(self) -> Iterator[dict]:
         """
@@ -606,27 +592,9 @@ class SJSONLDataset(IterableDataset):
         Yields:
             Dictionary containing 'input_ids' and 'labels'
         """
-        (
-            worker_files,
-            rng,
-            current_file_idx,
-            file_state,
-            buffer_state,
-            epoch,
-            global_worker_id,
-            total_workers,
-        ) = self._setup_worker_context(self.files, self.shuffle_files, self.resume_state)
-        
-        yield from self._iterate_files(
-            worker_files=worker_files,
-            rng=rng,
-            current_file_idx=current_file_idx,
-            file_state=file_state,
-            buffer_state=buffer_state,
-            epoch=epoch,
-            global_worker_id=global_worker_id,
-            total_workers=total_workers,
-        )
+        # Initialize or restore worker runtime state
+        self._setup_worker_context(self.files, self.shuffle_files, self.resume_state)
+        yield from self._iterate_files()
 
     def __len__(self) -> int:
         raise NotImplementedError("__len__ is not implemented for SJSONLDataset.")
