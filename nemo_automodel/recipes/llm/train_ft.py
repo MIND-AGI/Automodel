@@ -54,6 +54,7 @@ from nemo_automodel.components.distributed.init_utils import (
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
@@ -124,6 +125,55 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
         return cfg.step_scheduler.local_batch_size // cfg.autopipeline.pp_microbatch_size
     return 1
+
+
+def build_internist(cfg):
+    """Build and initialize internists for runtime model inspection.
+    
+    Reads from cfg.internist.<internist_name>
+    Returns a dict of {internist_name: internist_instance} for enabled internists.
+    """
+    from nemo_automodel.components.internist.activation_internist import ActivationInternist
+    from nemo_automodel.components.internist.weight_internist import WeightInternist
+    from nemo_automodel.components.internist.moe_internist import MoeInternist
+    
+    internists_cfg = None
+    if hasattr(cfg, "internist"):
+        internists_cfg = cfg.internist 
+
+    internists = {}
+
+    if internists_cfg is None:
+        return internists
+    
+    # Initialize ActivationInternist if enabled
+    act_internist_cfg = getattr(internists_cfg, "activation_internist", None)
+    if act_internist_cfg is not None:
+        act_internist = ActivationInternist(act_internist_cfg)
+        if act_internist.enabled():
+            internists["activation_internist"] = act_internist
+            logger.info(f"Activation internist enabled with interval: {act_internist.get_interval()}")
+
+    # Initialize WeightInternist if enabled
+    weight_internist_cfg = getattr(internists_cfg, "weight_internist", None)
+    if weight_internist_cfg is not None:
+        weight_internist = WeightInternist(weight_internist_cfg)
+        if weight_internist.enabled():
+            internists["weight_internist"] = weight_internist
+            logger.info(f"Weight internist enabled with interval: {weight_internist.get_interval()}")
+
+    # Initialize MoeInternist if enabled
+    moe_internist_cfg = getattr(internists_cfg, "moe_internist", None)
+    if moe_internist_cfg is not None:
+        moe_internist = MoeInternist(moe_internist_cfg)
+        if moe_internist.enabled():
+            internists["moe_internist"] = moe_internist
+            logger.info(f"MoE internist enabled with interval: {moe_internist.get_interval()}")
+
+    # Future internists can be added here similarly
+    # e.g., embedding_internist, gradient_norm_internist, etc.
+    
+    return internists
 
 
 def build_model_and_optimizer(
@@ -346,16 +396,16 @@ def build_model_and_optimizer(
             trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
             # Log dtypes of trainable parameters for safe precision training
-            for p in trainable_params:
-                logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
+            # for p in trainable_params:
+            #     logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
 
             optimizer.append(cfg_opt.instantiate(params=trainable_params))
     else:
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         # Log dtypes of trainable parameters for safe precision training
-        for p in trainable_params:
-            logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
+        # for p in trainable_params:
+        #     logger.info(f"Trainable param: {p.shape}, dtype: {p.dtype}")
 
         optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
@@ -722,7 +772,8 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
         default_kwargs.update(
             dict(
                 optimizer=opt,
-                init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
+                # init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
+                init_lr = 0.0,  # Start warmup at 0
                 max_lr=base_lr,
                 min_lr=base_lr * 0.01,  # End at 1% of base LR
                 start_wd=opt.param_groups[0].get("weight_decay", 0.0),
@@ -806,7 +857,8 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
             }
         )
 
-    return loss_fn(**loss_fn_kwargs)
+    aux_loss = kwargs.pop("aux_loss", 0.0)
+    return loss_fn(**loss_fn_kwargs) + aux_loss
 
 
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
@@ -925,6 +977,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.pp_enabled: bool = (
             True if hasattr(self.model_wrapper, "pp_size") and self.model_wrapper.pp_size > 1 else False
         )
+        
+        # Build internists for runtime inspection
+        self.internists = build_internist(self.cfg)
+        
         autopipeline_cfg = self.cfg.get("autopipeline", None)
         if self.pp_enabled:
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
@@ -1126,6 +1182,62 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             metrics[f"data_scheduler/weight/{safe_name}"] = float(weight)
         return metrics
 
+    def _should_collect_internist_metrics(self) -> bool:
+        """Check if any internist should log metrics at this step."""
+        if not self.internists:
+            return False
+        # Check if any enabled internist wants to collect metrics at this step
+        for name, internist in self.internists.items():
+            interval = internist.get_interval()
+            if interval is not None and self.step_scheduler.step % interval == 0:
+                return True
+        return False
+
+    def _init_internist_buffers(self):
+        """Reset buffers for all active internists at the start of each training step."""
+        for name, internist in self.internists.items():
+            internist.reset_buffer()
+
+    def _accumulate_internist_stats(self, output, model=None, final_batch: bool = False) -> None:
+        """Accumulate statistics from model output for all active internists.
+        
+        Args:
+            output: Model output object (e.g., MoeCausalLMOutputWithPast or similar).
+            model: Model instance for weight_internist to extract parameters directly.
+            final_batch: Whether this is the final batch (used to trigger weight collection).
+        """
+        if not self.internists:
+            return
+        
+        # For activation_internist: extract hidden_states directly from output
+        if "activation_internist" in self.internists:
+            hidden_states = getattr(output, "hidden_states", None)
+            if hidden_states is None:
+                raise ValueError("Output does not contain hidden_states required for activation_internist")
+            self.internists["activation_internist"].accumulate(hidden_states)
+        
+        # For weight_internist: pass model directly to extract weights
+        if "weight_internist" in self.internists and final_batch and model is not None:
+            self.internists["weight_internist"].accumulate(model)
+        
+        # For moe_internist: extract router_logits directly from output
+        if "moe_internist" in self.internists:
+            router_logits = getattr(output, "router_logits", None)
+            if router_logits is not None:
+                self.internists["moe_internist"].accumulate(router_logits)
+
+    def _finalize_internist_metrics(self) -> Dict[str, float]:
+        """Finalize and collect metrics from all active internists."""
+        if not self.internists:
+            return {}
+        
+        metrics = {}
+        for name, internist in self.internists.items():
+            internist_metrics = internist.finalize(dp_allreduce=self._dp_allreduce)
+            metrics.update(internist_metrics)
+        
+        return metrics
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1235,9 +1347,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         batch,
         *,
         loss_buffer,
+        aux_loss_buffer,
         num_label_tokens,
         num_batches,
         is_train: bool = True,
+        final_batch: bool = False,
     ):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
@@ -1248,6 +1362,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        # Enable output_hidden_states and output_router_logits if internists need them
+        if self._should_collect_internist_metrics():
+            batch["output_hidden_states"] = True
+        batch["output_router_logits"] = True
+
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
@@ -1296,14 +1415,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
+                hidden_states = getattr(out, "hidden_states", None)
+                aux_loss = getattr(out, "aux_loss", 0.0)
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
+                    aux_loss=aux_loss,
                     labels=labels,
                     model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                    hidden_states=hidden_states[-1] if hidden_states is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
+                if self._should_collect_internist_metrics():
+                    self._accumulate_internist_stats(out, model=model, final_batch=final_batch)
+                if aux_loss is not None:
+                    aux_loss_buffer.append(aux_loss.clone().detach())
+
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1321,6 +1448,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
+        aux_loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -1332,12 +1460,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
+        should_collect_internist_metrics = self._should_collect_internist_metrics()
+        if should_collect_internist_metrics:
+            self._init_internist_buffers()
+
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
             self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                i,
+                batch,
+                loss_buffer=loss_buffer,
+                aux_loss_buffer=aux_loss_buffer,
+                num_label_tokens=num_label_tokens,
+                num_batches=num_batches,
+                final_batch=(i == num_batches - 1)
             )
 
         grad_norm = scale_grads_and_clip_grad_norm(
@@ -1403,24 +1541,31 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 torch.distributed.recv(reporting_loss, src=src_rank)
 
         reporting_loss = reporting_loss.cpu().item()
+
+        reporting_aux_loss = 0.0
+        if aux_loss_buffer:
+            reporting_aux_loss = torch.sum(torch.stack(aux_loss_buffer))       
+            reporting_aux_loss = self._dp_allreduce(reporting_aux_loss, include_cp=True).cpu().item()
         # fix reporting_loss, tps across ranks
 
         scheduler_metrics = self._get_data_scheduler_metrics(self.step_scheduler.step)
+        internist_metrics = self._finalize_internist_metrics() if should_collect_internist_metrics else {}
+        metrics = {
+            "loss": reporting_loss,
+            "aux_loss": reporting_aux_loss,
+            "grad_norm": grad_norm,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+            "num_tokens_per_step": num_tokens_in_batch,
+            "num_label_tokens": num_label_tokens,
+        } | scheduler_metrics | internist_metrics
 
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": reporting_loss,
-                "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
-                "num_tokens_per_step": num_tokens_in_batch,
-                "num_label_tokens": num_label_tokens,
-            }
-            | scheduler_metrics,
+            metrics=metrics,
         )
 
     @torch.no_grad()
