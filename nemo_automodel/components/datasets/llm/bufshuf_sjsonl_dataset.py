@@ -18,6 +18,7 @@ import glob
 import json
 import os
 import random
+from copy import deepcopy
 from pathlib import Path
 from typing import Iterator, List, Sequence, Optional, TypedDict, Dict, Any
 
@@ -45,15 +46,18 @@ class BufShufBufferState(TypedDict):
     """State for the enhanced document buffer.
     
     Attributes:
-        token_buffer: Accumulated tokens waiting to be sampled
-        token_buffer_offset: Offset within token buffer
-        sample_buffer: Pre-generated shuffled samples ready to yield
-        sample_buffer_idx: Index of next sample to yield from sample_buffer
+        shuffle_token_buffer: Token buffer snapshot at last shuffle
+        shuffle_file_state: File state snapshot at last shuffle
+        shuffle_rng_state: RNG state used for last shuffle
+        emitted_since_shuffle: Emitted sample count since last shuffle
+        replaced_since_shuffle: Replacement count since last shuffle
         documents_processed: Counter for documents seen
     """
-    token_buffer: List[int]
-    sample_buffer: List[Dict[str, List[int]]]
-    sample_buffer_idx: int
+    shuffle_token_buffer: List[int]
+    shuffle_file_state: JSONLFileState
+    shuffle_rng_state: dict
+    emitted_since_shuffle: int
+    replaced_since_shuffle: int
     documents_processed: int
 
 
@@ -61,9 +65,7 @@ class BufShufSJSONLDatasetState(TypedDict):
     """Complete state for enhanced JSONL dataset checkpointing."""
     current_file_idx: int
     files_order: List[str]
-    file_state: JSONLFileState
     buffer_state: BufShufBufferState
-    rng_state: dict
     epoch: int
     global_worker_id: int
     total_workers: int
@@ -152,6 +154,7 @@ class BufShufSJSONLDataset(IterableDataset):
         
         # Internal state tracking
         self._current_state: Optional[BufShufSJSONLDatasetState] = None
+        self._resume_pending = False
 
     def state_dict(self) -> BufShufSJSONLDatasetState:
         """Returns current state for checkpointing."""
@@ -166,28 +169,28 @@ class BufShufSJSONLDataset(IterableDataset):
             return BufShufSJSONLDatasetState(
                 current_file_idx=0,
                 files_order=self.files.copy(),
-                file_state=JSONLFileState(
-                    file_path=self.files[0] if self.files else "",
-                    position=0,
-                    line_number=0,
-                    block_size=block_size,
-                    offset=offset,
-                    current_iter=0,
-                ),
                 buffer_state=BufShufBufferState(
-                    token_buffer=[],
-                    sample_buffer=[],
-                    sample_buffer_idx=0,
+                    shuffle_token_buffer=[],
+                    shuffle_file_state=JSONLFileState(
+                        file_path=self.files[0] if self.files else "",
+                        position=0,
+                        line_number=0,
+                        block_size=block_size,
+                        offset=offset,
+                        current_iter=0,
+                    ),
+                    shuffle_rng_state=random.Random().getstate(),
+                    emitted_since_shuffle=0,
+                    replaced_since_shuffle=0,
                     documents_processed=0,
                 ),
-                rng_state=random.Random().getstate(),
                 epoch=0,
                 global_worker_id=global_worker_id,
                 total_workers=total_workers,
                 tokenizer_config=self.tokenizer_config,
             )
         
-        return self._current_state.copy()
+        return deepcopy(self._current_state)
 
     def load_state_dict(self, state: BufShufSJSONLDatasetState) -> None:
         """Load a previously saved state to resume iteration."""
@@ -266,19 +269,23 @@ class BufShufSJSONLDataset(IterableDataset):
                     f"got {resume_state['total_workers']}"
                 )
             
-            rng.setstate(resume_state["rng_state"])
             worker_files = resume_state["files_order"].copy()
             current_file_idx = resume_state["current_file_idx"]
-            file_state = resume_state["file_state"].copy()
             buffer_state = resume_state["buffer_state"].copy()
+            shuffle_file_state = buffer_state["shuffle_file_state"].copy()
+            file_state = shuffle_file_state.copy()
             # Ensure token_buffer is a copy to avoid accidental shared refs
             buffer_state = BufShufBufferState(
-                token_buffer=buffer_state.get("token_buffer", []).copy(),
-                sample_buffer=buffer_state.get("sample_buffer", []).copy(),
-                sample_buffer_idx=buffer_state.get("sample_buffer_idx", 0),
+                shuffle_token_buffer=buffer_state.get("shuffle_token_buffer", []).copy(),
+                shuffle_file_state=shuffle_file_state,
+                shuffle_rng_state=buffer_state["shuffle_rng_state"],
+                emitted_since_shuffle=buffer_state.get("emitted_since_shuffle", 0),
+                replaced_since_shuffle=buffer_state.get("replaced_since_shuffle", 0),
                 documents_processed=buffer_state.get("documents_processed", 0),
             )
+            rng.setstate(buffer_state["shuffle_rng_state"])
             epoch = resume_state["epoch"]
+            self._resume_pending = True
         else:
             if worker is not None:
                 rng.seed(worker.id + 12345)
@@ -311,20 +318,21 @@ class BufShufSJSONLDataset(IterableDataset):
             )
             
             buffer_state = BufShufBufferState(
-                token_buffer=[],
-                sample_buffer=[],
-                sample_buffer_idx=0,
+                shuffle_token_buffer=[],
+                shuffle_file_state=file_state,
+                shuffle_rng_state=rng.getstate(),
+                emitted_since_shuffle=0,
+                replaced_since_shuffle=0,
                 documents_processed=0,
             )
             
             epoch = 0
+            self._resume_pending = False
 
         self._current_state = BufShufSJSONLDatasetState(
             current_file_idx=current_file_idx,
             files_order=worker_files,
-            file_state=file_state,
             buffer_state=buffer_state,
-            rng_state=rng.getstate(),
             epoch=epoch,
             global_worker_id=global_worker_id,
             total_workers=total_workers,
@@ -335,7 +343,7 @@ class BufShufSJSONLDataset(IterableDataset):
             self._current_state["files_order"],
             rng,
             self._current_state["current_file_idx"],
-            self._current_state["file_state"],
+            file_state,
             self._current_state["buffer_state"],
             self._current_state["epoch"],
             self._current_state["global_worker_id"],
@@ -357,9 +365,7 @@ class BufShufSJSONLDataset(IterableDataset):
         self._current_state = BufShufSJSONLDatasetState(
             current_file_idx=current_file_idx,
             files_order=files_order,
-            file_state=file_state,
             buffer_state=buffer_state,
-            rng_state=rng.getstate(),
             epoch=epoch,
             global_worker_id=global_worker_id,
             total_workers=total_workers,
@@ -410,6 +416,74 @@ class BufShufSJSONLDataset(IterableDataset):
                 current_iter=file_state["current_iter"],
             )
 
+    def _rebuild_buffer_from_state(
+        self,
+        buffer_state: BufShufBufferState,
+        rng: random.Random,
+    ) -> tuple[List[int], List[dict], int, int, JSONLFileState, random.Random]:
+        """Rebuild sample_buffer by replaying from last shuffle state."""
+        rng.setstate(buffer_state["shuffle_rng_state"])
+        token_buffer = buffer_state["shuffle_token_buffer"].copy()
+        documents_processed = buffer_state["documents_processed"]
+        file_state = buffer_state["shuffle_file_state"].copy()
+        emitted_since_shuffle = buffer_state["emitted_since_shuffle"]
+
+        sample_buffer: List[dict] = []
+        sample_buffer_idx = 0
+        emit_idx = 0
+
+        line_iter = self._read_jsonl_lines(
+            file_path=file_state["file_path"],
+            position=file_state["position"],
+            line_number=file_state["line_number"],
+            block_size=file_state["block_size"],
+            offset=file_state["offset"],
+        )
+
+        while len(sample_buffer) < self.sample_buffer_size:
+            next_sample, file_state, token_buffer, documents_processed = (
+                self._next_sample_from_file_state(
+                    line_iter,
+                    file_state,
+                    token_buffer,
+                    documents_processed,
+                )
+            )
+            if next_sample is None:
+                break
+            sample_buffer.append(next_sample)
+
+        if len(sample_buffer) == self.sample_buffer_size:
+            rng.shuffle(sample_buffer)
+
+        emitted_target = emitted_since_shuffle
+        for _ in range(emitted_target):
+            if not sample_buffer:
+                break
+            # if sample_buffer_idx >= len(sample_buffer):
+            #     sample_buffer_idx = 0
+            #     if len(sample_buffer) > 1:
+            #         rng.shuffle(sample_buffer)
+
+            emit_idx = sample_buffer_idx
+            replacement_sample, file_state, token_buffer, documents_processed = (
+                self._next_sample_from_file_state(
+                    line_iter,
+                    file_state,
+                    token_buffer,
+                    documents_processed,
+                )
+            )
+            if replacement_sample is not None:
+                sample_buffer[emit_idx] = replacement_sample
+                sample_buffer_idx += 1
+            else:
+                sample_buffer.pop(emit_idx)
+                if sample_buffer_idx >= len(sample_buffer):
+                    sample_buffer_idx = 0
+
+        return token_buffer, sample_buffer, sample_buffer_idx, documents_processed, file_state, rng
+
     def _process_file_with_buffer(
         self,
         file_path: str,
@@ -431,13 +505,31 @@ class BufShufSJSONLDataset(IterableDataset):
         3. Replace emitted slot immediately with a new sample when available.
         4. When pointer wraps to the beginning, shuffle the whole buffer.
         """
-        token_buffer = buffer_state["token_buffer"]
-        sample_buffer = buffer_state["sample_buffer"]
-        sample_buffer_idx = buffer_state["sample_buffer_idx"]
+        token_buffer: List[int] = []
+        sample_buffer: List[dict] = []
+        sample_buffer_idx = 0
         documents_processed = buffer_state["documents_processed"]
-        loaded_buffer = len(sample_buffer) > 0
-        if sample_buffer_idx >= len(sample_buffer):
-            sample_buffer_idx = 0
+        shuffle_token_buffer = buffer_state["shuffle_token_buffer"].copy()
+        shuffle_file_state = buffer_state["shuffle_file_state"].copy()
+        shuffle_rng_state = buffer_state["shuffle_rng_state"]
+        emitted_since_shuffle = buffer_state["emitted_since_shuffle"]
+        replaced_since_shuffle = buffer_state["replaced_since_shuffle"]
+        loaded_buffer = False
+
+        prev_file_state = shuffle_file_state.copy()
+        prev_token_buffer = shuffle_token_buffer.copy()
+
+        if self._resume_pending:
+            token_buffer, sample_buffer, sample_buffer_idx, documents_processed, file_state, rng = (
+                self._rebuild_buffer_from_state(buffer_state, rng)
+            )
+            shuffle_token_buffer = buffer_state["shuffle_token_buffer"].copy()
+            shuffle_file_state = buffer_state["shuffle_file_state"].copy()
+            shuffle_rng_state = buffer_state["shuffle_rng_state"]
+            emitted_since_shuffle = buffer_state["emitted_since_shuffle"]
+            replaced_since_shuffle = buffer_state["replaced_since_shuffle"]
+            loaded_buffer = len(sample_buffer) > 0
+            self._resume_pending = False
 
         line_iter = self._read_jsonl_lines(
             file_path=file_state["file_path"],
@@ -461,12 +553,29 @@ class BufShufSJSONLDataset(IterableDataset):
             sample_buffer.append(next_sample)
 
         if len(sample_buffer) == self.sample_buffer_size and not loaded_buffer:
+            shuffle_rng_state = rng.getstate()
+            # shuffle_file_state = file_state.copy()
+            # shuffle_token_buffer = token_buffer.copy()
+            prev_token_buffer = token_buffer.copy()
+            prev_file_state = file_state.copy()
+            
+            emitted_since_shuffle = 0
+            replaced_since_shuffle = 0
             rng.shuffle(sample_buffer)
 
         while sample_buffer:
-            if sample_buffer_idx >= len(sample_buffer):
+            if sample_buffer_idx >= self.sample_buffer_size:
                 sample_buffer_idx = 0
                 if len(sample_buffer) > 1:
+                    shuffle_rng_state = rng.getstate()
+                    shuffle_file_state = prev_file_state.copy()
+                    shuffle_token_buffer = prev_token_buffer.copy()
+
+                    prev_file_state = file_state.copy()
+                    prev_token_buffer = token_buffer.copy()
+                    
+                    emitted_since_shuffle = 0
+                    replaced_since_shuffle = 0
                     rng.shuffle(sample_buffer)
 
             emit_idx = sample_buffer_idx
@@ -483,16 +592,18 @@ class BufShufSJSONLDataset(IterableDataset):
             if replacement_sample is not None:
                 sample_buffer[emit_idx] = replacement_sample
                 sample_buffer_idx += 1
+                replaced_since_shuffle += 1
             else:
                 sample_buffer.pop(emit_idx)
                 if sample_buffer_idx >= len(sample_buffer):
                     sample_buffer_idx = 0
+            emitted_since_shuffle += 1
             
-            # No offset tracking: token_buffer is maintained as the authoritative
-            # remaining tokens after consumption.
-            self._current_state["buffer_state"]["token_buffer"] = token_buffer
-            self._current_state["buffer_state"]["sample_buffer"] = sample_buffer
-            self._current_state["buffer_state"]["sample_buffer_idx"] = sample_buffer_idx
+            self._current_state["buffer_state"]["shuffle_token_buffer"] = shuffle_token_buffer
+            self._current_state["buffer_state"]["shuffle_file_state"] = shuffle_file_state
+            self._current_state["buffer_state"]["shuffle_rng_state"] = shuffle_rng_state
+            self._current_state["buffer_state"]["emitted_since_shuffle"] = emitted_since_shuffle
+            self._current_state["buffer_state"]["replaced_since_shuffle"] = replaced_since_shuffle
             self._current_state["buffer_state"]["documents_processed"] = documents_processed
             
 
@@ -501,9 +612,11 @@ class BufShufSJSONLDataset(IterableDataset):
         # Update final state
         # Final buffer state: remaining token_buffer saved as-is.
         final_buffer_state = BufShufBufferState(
-            token_buffer=token_buffer.copy(),
-            sample_buffer=[],
-            sample_buffer_idx=0,
+            shuffle_token_buffer=token_buffer.copy(),
+            shuffle_file_state=file_state.copy(),
+            shuffle_rng_state=rng.getstate(),
+            emitted_since_shuffle=0,
+            replaced_since_shuffle=0,
             documents_processed=documents_processed,
         )
         
