@@ -857,8 +857,11 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
             }
         )
 
-    aux_loss = kwargs.pop("aux_loss", 0.0)
-    return loss_fn(**loss_fn_kwargs) + aux_loss
+    aux_loss = kwargs.pop("aux_loss", None)
+    if aux_loss is None:
+        return loss_fn(**loss_fn_kwargs)
+    else:
+        return loss_fn(**loss_fn_kwargs) + aux_loss
 
 
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
@@ -1416,7 +1419,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     out = model(**batch)
 
                 hidden_states = getattr(out, "hidden_states", None)
-                aux_loss = getattr(out, "aux_loss", 0.0)
+                aux_loss = getattr(out, "aux_loss", None)
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
